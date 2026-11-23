@@ -1,0 +1,15 @@
+# Production dependencies for Zuperior MT5 Algorithmic Signal Engine
+# Python 3.11+
+
+# MetaTrader 5 official Windows API (install in Windows or Wine Python environment)
+MetaTrader5>=5.0.45; platform_system == "Windows"
+
+# Core Numerical & Data Analysis
+numpy>=1.26.0
+pandas>=2.1.0
+
+# HTTP & Webhook Notifications
+requests>=2.31.0
+
+# Environment Variable Management
+python-dotenv>=1.0.0
