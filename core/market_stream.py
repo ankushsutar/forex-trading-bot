@@ -3,9 +3,9 @@ core/market_stream.py
 ---------------------
 Resilient asynchronous WebSocket client managing Binance market data streams:
 - <symbol>@kline_<interval>: filters strictly for closed bars (kline.x == True) to prevent repainting.
-- <symbol>@bookTicker: real-time top-of-book bid/ask and spread monitoring.
 - <symbol>@markPrice: real-time mark price and 8-hour funding rate skew surveillance.
-Includes automatic exponential backoff reconnection and REST warm-up buffer.
+- get_live_spread_bps: low-latency cached REST / ticker spread monitoring to eliminate socket flooding.
+Built on Python's native `websockets` library with exponential backoff reconnects and RFC 6455 ping compliance.
 """
 
 import asyncio
@@ -14,9 +14,9 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Any
-import aiohttp
 import pandas as pd
 import requests
+import websockets
 
 from config.settings import settings, TradingMode
 from config.symbols import SYMBOL_REGISTRY
@@ -44,7 +44,6 @@ class MarketStreamManager:
         self._on_closed_bar_callbacks: List[Callable[[str, pd.DataFrame], Any]] = []
 
         self._running = False
-        self._ws_task: Optional[asyncio.Task] = None
 
     def add_closed_bar_listener(self, callback: Callable[[str, pd.DataFrame], Any]):
         """Registers a callback to be triggered whenever a kline closes (kline.x == True)."""
@@ -87,13 +86,44 @@ class MarketStreamManager:
             except Exception as e:
                 logger.warning(f"Could not warm up history for {sym}: {e}")
 
+    def get_live_spread_bps(self, symbol: str) -> float:
+        """
+        Retrieves real-time top-of-book bid-ask spread in basis points.
+        Cached for up to 5 seconds to eliminate socket flooding, otherwise refreshes from REST (Weight: 1).
+        """
+        now = time.time()
+        cached = self.book_tickers.get(symbol)
+        if cached and (now - cached.get("time", 0.0) < 5.0):
+            return cached.get("spread_bps", 1.0)
+
+        endpoint = "/fapi/v1/ticker/bookTicker" if settings.trading_mode == TradingMode.USD_M_FUTURES else "/api/v3/ticker/bookTicker"
+        url = f"{self.rest_base_url}{endpoint}"
+
+        try:
+            resp = requests.get(url, params={"symbol": symbol}, timeout=3)
+            if resp.status_code == 200:
+                d = resp.json()
+                bid = float(d.get("bidPrice", 0.0))
+                ask = float(d.get("askPrice", 0.0))
+                spread_bps = ((ask - bid) / ask * 10000.0) if ask > 0 else 1.0
+                self.book_tickers[symbol] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_bps": spread_bps,
+                    "time": now
+                }
+                return spread_bps
+        except Exception as e:
+            logger.debug(f"Could not fetch REST bookTicker for {symbol}: {e}")
+
+        return cached.get("spread_bps", 1.0) if cached else 1.0
+
     def build_stream_url(self) -> str:
         """Constructs multiplex stream URL for all registered symbols."""
         streams = []
         for s in self.symbols:
             s_lower = s.lower()
             streams.append(f"{s_lower}@kline_{self.timeframe}")
-            streams.append(f"{s_lower}@bookTicker")
             if settings.trading_mode == TradingMode.USD_M_FUTURES:
                 streams.append(f"{s_lower}@markPrice")
 
@@ -111,20 +141,19 @@ class MarketStreamManager:
             url = self.build_stream_url()
             logger.info(f"Connecting to Binance WebSocket multiplex stream ({len(self.symbols)} pairs)...")
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20.0, timeout=10.0) as ws:
-                        logger.info("WebSocket connected. Subscribed to live market stream.")
-                        backoff = 1  # Reset backoff upon successful connection
+                # ping_interval=None relies on automatic RFC 6455 pong replies to server pings,
+                # preventing spurious client-side timeouts and transport write contention.
+                async with websockets.connect(url, ping_interval=None, close_timeout=5.0) as ws:
+                    logger.info("WebSocket connected. Subscribed to live market stream.")
+                    backoff = 1  # Reset backoff upon successful connection
 
-                        async for msg in ws:
-                            if not self._running:
-                                break
-
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                self._handle_stream_message(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                logger.warning(f"WebSocket closed with type {msg.type}")
-                                break
+                    while self._running:
+                        try:
+                            msg = await ws.recv()
+                            self._handle_stream_message(msg)
+                        except websockets.ConnectionClosed:
+                            logger.warning("Binance WebSocket stream closed by remote server.")
+                            break
 
             except Exception as e:
                 logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
@@ -142,31 +171,13 @@ class MarketStreamManager:
             stream_name = payload.get("stream", "")
             data = payload.get("data", {})
 
-            if "@bookTicker" in stream_name:
-                self._process_book_ticker(data)
-            elif "@kline" in stream_name:
+            if "@kline" in stream_name:
                 self._process_kline(data)
             elif "@markPrice" in stream_name:
                 self._process_mark_price(data)
 
         except Exception as e:
             logger.debug(f"Error handling stream message: {e}")
-
-    def _process_book_ticker(self, d: dict):
-        """Calculates top-of-book bid, ask, and spread in basis points."""
-        sym = d.get("s")
-        if not sym:
-            return
-        bid = float(d.get("b", 0.0))
-        ask = float(d.get("a", 0.0))
-        spread_bps = ((ask - bid) / ask * 10000.0) if ask > 0 else 0.0
-
-        self.book_tickers[sym] = {
-            "bid": bid,
-            "ask": ask,
-            "spread_bps": spread_bps,
-            "time": time.time()
-        }
 
     def _process_mark_price(self, d: dict):
         """Tracks Futures Mark Price and current 8-hour funding rate."""

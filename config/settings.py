@@ -40,7 +40,7 @@ class BinanceEndpoints:
     @property
     def ws_url(self) -> str:
         if self.mode == TradingMode.USD_M_FUTURES:
-            return "wss://stream.binancefuture.com" if self.testnet else "wss://fstream.binance.com"
+            return "wss://stream.binancefuture.com" if self.testnet else "wss://fstream.binance.com/market"
         else:
             return "wss://testnet.binance.vision" if self.testnet else "wss://stream.binance.com:9443"
 

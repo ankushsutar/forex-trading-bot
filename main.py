@@ -119,8 +119,9 @@ class BinanceQuantitativeEngine:
                 continue
 
             last_close = float(df['close'].iloc[-1])
-            spread_bps = 1.0  # baseline
-            funding_rate = 0.0001
+            spread_bps = self.stream_manager.get_live_spread_bps(sym)
+            mark = self.stream_manager.mark_prices.get(sym, {})
+            funding_rate = mark.get("funding_rate", 0.0001)
 
             verdict = self.regime_filter.classify_regime(sym, df, spread_bps=spread_bps, funding_rate=funding_rate)
             signal = self.signal_engine.evaluate(sym, df, spread_bps=spread_bps, funding_rate=funding_rate)
@@ -154,8 +155,7 @@ class BinanceQuantitativeEngine:
         Event-driven callback triggered exclusively when a candle closes (kline.x == True).
         Guarantees zero repainting.
         """
-        ticker = self.stream_manager.book_tickers.get(symbol, {})
-        spread_bps = ticker.get("spread_bps", 1.0)
+        spread_bps = self.stream_manager.get_live_spread_bps(symbol)
         mark = self.stream_manager.mark_prices.get(symbol, {})
         funding_rate = mark.get("funding_rate", 0.0001)
 
