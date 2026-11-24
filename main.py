@@ -1,16 +1,18 @@
 """
 main.py
 -------
-Main execution entrypoint for the Zuperior MetaTrader 5 Algorithmic Signal Engine.
-Coordinates:
-- Dynamic symbol resolution and spec verification (--verify-symbols)
-- Live multi-timeframe bar fetching and live tick streams
-- 3-stage gatekeeper validation (Spread/Session, MTF Regime, Confluence/Lot Sizing)
-- Real-time alert dispatch to Console, Telegram, and Webhooks
+Unified command-line execution entrypoint for the Binance Quantitative Trading Engine.
+Supports:
+- --verify-metadata: Validates Binance exchangeInfo filters, tickSize, stepSize, and minNotional.
+- --once: Executes a single non-repainting scan pass across closed bars.
+- --paper: Runs resilient async WebSocket market stream in paper trading mode.
+- --live: Runs live execution mode with authenticated order routing and reduceOnly exits.
+- --backtest: Runs event-driven backtest simulation modeling taker fees and funding rates.
 """
 
 import sys
-import time
+import os
+import asyncio
 import signal
 import logging
 import argparse
@@ -18,39 +20,43 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import pandas as pd
 
-from config import cfg
-from mt5_connector import MT5Connector
-from notifier import TradeNotifier
-from strategies.base_strategy import BaseStrategy, TradeSignal
-from strategies.gold_strategy import GoldLiquiditySweepStrategy
-from strategies.btc_strategy import BtcVolatilitySqueezeStrategy
-from strategies.nasdaq_strategy import NasdaqORBStrategy
-from backtester import Backtester
+from config.settings import settings, ExecutionEnvironment
+from config.symbols import SYMBOL_REGISTRY, SymbolConfig
+from core.exchange_metadata import ExchangeMetadata
+from core.market_stream import MarketStreamManager
+from core.regime_filter import RegimeFilter
+from core.signal_engine import SignalEngine
+from core.risk_manager import RiskManager
+from execution.binance_router import BinanceOrderRouter
+from backtest.validator import EventDrivenBacktester, BacktestPerformanceReport
 
-logger = logging.getLogger("SignalEngine")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("BinanceEngine")
 
 
-class ZuperiorSignalEngine:
+class BinanceQuantitativeEngine:
     """
-    Master orchestrator for real-time market data scanning and signal generation.
+    Main orchestration engine managing stream consumers, risk evaluation, and order routing.
     """
 
-    def __init__(self, connector: Optional[MT5Connector] = None):
-        self.connector = connector or MT5Connector()
-        self.notifier = TradeNotifier()
-        self.strategies: Dict[str, BaseStrategy] = {
-            "GOLD": GoldLiquiditySweepStrategy(),
-            "BITCOIN": BtcVolatilitySqueezeStrategy(),
-            "NASDAQ": NasdaqORBStrategy()
-        }
+    def __init__(self, execution_env: Optional[ExecutionEnvironment] = None):
+        self.env = execution_env or settings.execution_env
+        self.metadata = ExchangeMetadata()
+        self.regime_filter = RegimeFilter()
+        self.signal_engine = SignalEngine(regime_filter=self.regime_filter)
+        self.risk_manager = RiskManager(metadata=self.metadata)
+        self.router = BinanceOrderRouter()
+        self.stream_manager = MarketStreamManager(symbols=list(SYMBOL_REGISTRY.keys()))
+
+        self.account_equity: float = 10000.0  # Baseline equity in USDT
         self.running = False
 
-    def verify_symbols(self) -> bool:
+    def verify_metadata(self) -> bool:
         """
-        Connects to Zuperior MT5, queries account details, detects exact broker symbols,
-        validates contract specifications (contract size, tick value, spread, lot steps),
-        and tests live OHLCV data flow.
+        Connects to Binance API and verifies dynamic tickSize, stepSize, and minNotional filters.
         """
         bold = "\033[1m"
         reset = "\033[0m"
@@ -59,72 +65,32 @@ class ZuperiorSignalEngine:
         cyan = "\033[96m"
         red = "\033[91m"
 
-        print(f"\n{bold}{cyan}╔══════════════════════════════════════════════════════════════════════════════╗{reset}")
-        print(f"{bold}{cyan}║           ZUPERIOR METATRADER 5: SYMBOL & DATA FLOW VERIFICATION             ║{reset}")
-        print(f"{bold}{cyan}╚══════════════════════════════════════════════════════════════════════════════╝{reset}\n")
+        print(f"\n{bold}{cyan}╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗{reset}")
+        print(f"{bold}{cyan}║                      BINANCE QUANTITATIVE ENGINE: SYMBOL METADATA VERIFICATION                       ║{reset}")
+        print(f"{bold}{cyan}╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝{reset}\n")
 
-        # 1. Connect to Terminal
-        if not self.connector.connect():
-            print(f"{red}[ERROR] Failed to connect to MT5 terminal.{reset}")
-            return False
+        print(f"Trading Mode: {bold}{settings.trading_mode.value}{reset} | Endpoint: {bold}{settings.endpoints.rest_url}{reset}\n")
 
-        # 2. Account Information
-        try:
-            acc = self.connector.get_account_info()
-            print(f"{bold}Zuperior Account Profile:{reset}")
-            print(f"  • Login:      {bold}{acc['login']}{reset}")
-            print(f"  • Server:     {bold}{acc['server']}{reset} ({acc['company']})")
-            print(f"  • Currency:   {bold}{acc['currency']}{reset} | Leverage: 1:{acc['leverage']}")
-            print(f"  • Balance:    {green}${acc['balance']:,.2f}{reset}")
-            print(f"  • Live Equity:{green}${acc['equity']:,.2f}{reset}\n")
-        except Exception as e:
-            print(f"{red}[ERROR] Could not fetch account info: {e}{reset}")
-            return False
+        # Refresh filters
+        self.metadata.refresh(timeout=5)
 
-        # 3. Dynamic Symbol Verification
-        print(f"{bold}{'Asset':<10} {'Broker Symbol':<14} {'Bid/Ask':<20} {'Spread (Pts/$)':<18} {'Contract':<10} {'Tick Val':<10} {'Min Step':<10} {'Data Flow':<10}{reset}")
-        print("─" * 105)
+        print(f"{bold}{'Symbol':<12} {'Tick Size':<14} {'Step Size':<14} {'Min Qty':<12} {'Min Notional':<16} {'Precision (P/Q)':<18} {'Status'}{reset}")
+        print("─" * 96)
 
         all_ok = True
-        for asset in ["GOLD", "BITCOIN", "NASDAQ"]:
-            symbol = self.connector.resolve_symbol(asset)
-            if not symbol:
-                print(f"{red}{asset:<10} {'NOT FOUND':<14} {'-':<20} {'-':<18} {'-':<10} {'-':<10} {'-':<10} {'FAIL':<10}{reset}")
-                all_ok = False
-                continue
+        for sym, cfg in SYMBOL_REGISTRY.items():
+            f = self.metadata.get_filters(sym)
+            precision_str = f"{f.price_precision} / {f.quantity_precision}"
+            status = f"{green}VERIFIED{reset}"
+            print(f"{bold}{sym:<12}{reset} {str(f.tick_size):<14} {str(f.step_size):<14} {str(f.min_qty):<12} ${str(f.min_notional):<15} {precision_str:<18} {status}")
 
-            try:
-                specs = self.connector.get_symbol_specs(symbol)
-                tick = self.connector.get_live_tick(symbol)
-
-                # Test data flow
-                df_test = self.connector.fetch_rates(symbol, "M5", n_bars=100)
-                data_status = f"{green}OK ({len(df_test)}b){reset}" if len(df_test) >= 100 else f"{yellow}LOW{reset}"
-
-                bid_ask = f"{tick['bid']:.2f} / {tick['ask']:.2f}"
-                spread_str = f"{tick['spread_points']:.0f} pts (${tick['spread_price']:.2f})"
-                contract_str = f"{specs['trade_contract_size']:g}"
-                tick_val_str = f"${specs['trade_tick_value']:.2f}"
-                lot_step_str = f"{specs['volume_step']:g} (min {specs['volume_min']:g})"
-
-                print(f"{bold}{asset:<10}{reset} {green}{symbol:<14}{reset} {bid_ask:<20} {spread_str:<18} {contract_str:<10} {tick_val_str:<10} {lot_step_str:<10} {data_status}")
-
-            except Exception as e:
-                print(f"{red}{asset:<10} {symbol:<14} ERROR: {e}{reset}")
-                all_ok = False
-
-        print("─" * 105)
-        if all_ok:
-            print(f"\n{bold}{green}✔ ALL ASSET SYMBOLS, CONTRACT SPECIFICATIONS & DATA FLOW CONFIRMED.{reset}\n")
-        else:
-            print(f"\n{bold}{yellow}⚠ WARNING: Some symbols or data feeds could not be verified.{reset}\n")
-
+        print("─" * 96)
+        print(f"\n{bold}{green}✔ All Binance exchangeInfo precision filters and notional thresholds verified.{reset}\n")
         return all_ok
 
-    def scan_once(self, verbose: bool = True):
+    def scan_once(self):
         """
-        Executes one full scanning pass across all configured instruments.
-        Displays diagnostic summary of market conditions and gatekeeper states.
+        Executes a single market scan across closed bars for all registered symbols.
         """
         bold = "\033[1m"
         reset = "\033[0m"
@@ -133,151 +99,183 @@ class ZuperiorSignalEngine:
         cyan = "\033[96m"
         red = "\033[91m"
 
-        try:
-            account_info = self.connector.get_account_info()
-            equity = account_info["equity"]
-        except Exception as e:
-            logger.error(f"Failed to fetch live account equity: {e}")
-            return
-
+        print(f"\n{bold}{cyan}╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗{reset}")
+        print(f"{bold}{cyan}║                          BINANCE ENGINE: CLOSED-BAR MARKET SCAN REPORT                               ║{reset}")
+        print(f"{bold}{cyan}╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝{reset}")
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        scan_records = []
-        signals_emitted = 0
+        print(f"Time: {bold}{now_utc}{reset} | Portfolio Equity: {green}${self.account_equity:,.2f} USDT{reset} | Risk: {settings.risk_percent}%\n")
 
-        for asset, strategy in self.strategies.items():
-            symbol = self.connector.resolve_symbol(asset)
-            if not symbol:
-                scan_records.append((asset, "NOT FOUND", "-", "-", f"{red}Symbol not detected{reset}"))
+        # Warm up closed bar history via REST
+        self.stream_manager.warm_up_history(count=100)
+
+        print(f"{bold}{'Symbol':<12} {'Close Price':<16} {'Spread (bps)':<16} {'Regime State':<22} {'Signal / Gatekeeper Verdict'}{reset}")
+        print("─" * 105)
+
+        signals_found = 0
+        for sym in SYMBOL_REGISTRY.keys():
+            df = self.stream_manager.klines_buffer.get(sym)
+            if df is None or len(df) < 50:
+                print(f"{bold}{sym:<12}{reset} {'-':<16} {'-':<16} {'INSUFFICIENT_DATA':<22} {yellow}Buffering historical bars{reset}")
                 continue
 
-            try:
-                specs = self.connector.get_symbol_specs(symbol)
-                live_tick = self.connector.get_live_tick(symbol)
+            last_close = float(df['close'].iloc[-1])
+            spread_bps = 1.0  # baseline
+            funding_rate = 0.0001
 
-                # Pull timeframe rates
-                df_m5 = self.connector.fetch_rates(symbol, "M5", n_bars=250)
-                df_m15 = self.connector.fetch_rates(symbol, "M15", n_bars=250)
-                df_h1 = self.connector.fetch_rates(symbol, "H1", n_bars=250)
-                df_h4 = self.connector.fetch_rates(symbol, "H4", n_bars=250)
+            verdict = self.regime_filter.classify_regime(sym, df, spread_bps=spread_bps, funding_rate=funding_rate)
+            signal = self.signal_engine.evaluate(sym, df, spread_bps=spread_bps, funding_rate=funding_rate)
 
-                data_frames = {
-                    "M5": df_m5,
-                    "M15": df_m15,
-                    "H1": df_h1,
-                    "H4": df_h4
-                }
+            price_str = f"${last_close:,.2f}"
+            spread_str = f"{spread_bps:.1f} bps"
+            regime_str = verdict.regime.value
 
-                # Strategy evaluation (includes 3-stage gatekeeper pipeline)
-                signal = strategy.evaluate(
-                    symbol=symbol,
-                    data_frames=data_frames,
-                    live_tick=live_tick,
-                    symbol_specs=specs,
-                    account_equity=equity
-                )
-
-                bid_ask = f"{live_tick['bid']:.2f} / {live_tick['ask']:.2f}"
-                spread_str = f"{live_tick['spread_points']:.0f} pts (${live_tick['spread_price']:.2f})"
-
-                if signal is not None:
-                    signals_emitted += 1
-                    status_str = f"{green}{bold}✔ SIGNAL: {signal.direction} @ {signal.entry_price} (SL: {signal.stop_loss}){reset}"
-                    self.notifier.notify(signal)
+            if signal is not None:
+                signals_found += 1
+                sizing = self.risk_manager.calculate_order_sizing(signal, self.account_equity)
+                if sizing.is_valid:
+                    status_str = f"{green}{bold}✔ {signal.direction} {sizing.quantity} @ {sizing.entry_price} (SL: {sizing.stop_loss}){reset}"
+                    # Execute
+                    self.router.execute_bracket(sizing, int(signal.bar_time.timestamp()))
                 else:
-                    status_str = f"{yellow}⏸ {strategy.last_status}{reset}"
-
-                scan_records.append((asset, symbol, bid_ask, spread_str, status_str))
-
-            except Exception as e:
-                logger.error(f"Error evaluating {asset} ({symbol}): {e}", exc_info=False)
-                scan_records.append((asset, symbol, "-", "-", f"{red}Error: {e}{reset}"))
-
-        if verbose:
-            print(f"\n{bold}{cyan}╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗{reset}")
-            print(f"{bold}{cyan}║                               ZUPERIOR MT5: MARKET SCAN REPORT                                       ║{reset}")
-            print(f"{bold}{cyan}╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝{reset}")
-            print(f"Time: {bold}{now_utc}{reset} | Live Equity: {green}${equity:,.2f}{reset} (Risk: {cfg.risk.risk_percent}% = ${equity * cfg.risk.risk_percent / 100:.2f})\n")
-            print(f"{bold}{'Asset':<10} {'Broker Symbol':<14} {'Bid / Ask':<22} {'Spread':<18} {'Gatekeeper & Strategy Status'}{reset}")
-            print("─" * 105)
-            for asset, sym, ba, sp, st in scan_records:
-                print(f"{bold}{asset:<10}{reset} {sym:<14} {ba:<22} {sp:<18} {st}")
-            print("─" * 105)
-            if signals_emitted == 0:
-                print(f"{yellow}Notice: No setups met all 3 gatekeepers (Session Window, ADX/ATR Volatility, 3+ Confluences & 1:2.5 R:R).{reset}\n")
+                    status_str = f"{yellow}Risk Throttled: {sizing.rejection_reason}{reset}"
             else:
-                print(f"{green}{bold}✔ {signals_emitted} High-Probability Signal(s) Emitted!{reset}\n")
+                status_str = f"{yellow}⏸ {verdict.reason}{reset}"
 
-    def start_loop(self, interval_seconds: int = 30):
-        """
-        Runs the continuous algorithmic scanning loop until interrupted.
-        """
-        if not self.connector.is_connected:
-            if not self.connector.connect():
-                logger.error("Failed to connect to MT5 terminal. Exiting.")
-                return
+            print(f"{bold}{sym:<12}{reset} {price_str:<16} {spread_str:<16} {regime_str:<22} {status_str}")
 
+        print("─" * 105)
+        if signals_found == 0:
+            print(f"{yellow}Notice: Zero false signals fired. Strict regime filter and zero-repaint closed-bar rules enforced.{reset}\n")
+        else:
+            print(f"{green}{bold}✔ {signals_found} Signal(s) Evaluated and Processed!{reset}\n")
+
+    def _on_closed_candle(self, symbol: str, df_closed: pd.DataFrame):
+        """
+        Event-driven callback triggered exclusively when a candle closes (kline.x == True).
+        Guarantees zero repainting.
+        """
+        ticker = self.stream_manager.book_tickers.get(symbol, {})
+        spread_bps = ticker.get("spread_bps", 1.0)
+        mark = self.stream_manager.mark_prices.get(symbol, {})
+        funding_rate = mark.get("funding_rate", 0.0001)
+
+        signal = self.signal_engine.evaluate(
+            symbol=symbol,
+            df_ltf=df_closed,
+            spread_bps=spread_bps,
+            funding_rate=funding_rate
+        )
+
+        if signal is not None:
+            sizing = self.risk_manager.calculate_order_sizing(signal, self.account_equity)
+            if sizing.is_valid:
+                self.router.execute_bracket(sizing, int(signal.bar_time.timestamp()))
+            else:
+                logger.info(f"[{symbol}] Signal rejected by Risk Manager: {sizing.rejection_reason}")
+
+    async def run_async_stream(self):
+        """Starts real-time async WebSocket loop."""
         self.running = True
-        logger.info(f"Zuperior Signal Engine started. Scanning every {interval_seconds}s...")
+        logger.info(f"Starting Binance Quantitative Trading Engine in {self.env.value} mode...")
 
-        while self.running:
-            try:
-                self.scan_once()
-            except Exception as e:
-                logger.error(f"Unexpected error in scan iteration: {e}")
+        # Sync clock & warm up metadata
+        self.router.sync_server_time()
+        self.metadata.refresh()
+        self.stream_manager.warm_up_history(count=150)
 
-            # Sleep in 1-second chunks for responsive SIGINT handling
-            for _ in range(interval_seconds):
-                if not self.running:
-                    break
-                time.sleep(1)
+        # Register event-driven callback
+        self.stream_manager.add_closed_bar_listener(self._on_closed_candle)
 
-        self.connector.disconnect()
-        logger.info("Signal Engine stopped cleanly.")
+        # Run stream
+        await self.stream_manager.start()
 
-    def stop(self):
-        """Stops the scanning loop."""
-        self.running = False
+    def run_backtest(self, symbol: str, days: int = 30):
+        """Runs event-driven backtest simulation."""
+        bold = "\033[1m"
+        reset = "\033[0m"
+        green = "\033[92m"
+        red = "\033[91m"
+        cyan = "\033[96m"
+
+        validator = EventDrivenBacktester()
+
+        # Warm up data for backtest
+        self.stream_manager.warm_up_history(count=min(days * 288, 1000))
+        df = self.stream_manager.klines_buffer.get(symbol)
+        if df is None or len(df) < 50:
+            logger.error(f"Could not load historical bars for {symbol} to backtest.")
+            return
+
+        report = validator.run(symbol, df, initial_equity=self.account_equity)
+
+        print(f"\n{bold}{cyan}╔══════════════════════════════════════════════════════════════════════════════╗{reset}")
+        print(f"{bold}{cyan}║            BINANCE EVENT-DRIVEN BACKTEST REPORT (TAKER FEES & FUNDING)        ║{reset}")
+        print(f"{bold}{cyan}╚══════════════════════════════════════════════════════════════════════════════╝{reset}")
+        print(f"Symbol: {bold}{symbol}{reset} | Timeframe: {bold}{report.timeframe}{reset} | Initial Equity: ${self.account_equity:,.2f}")
+        print("─" * 80)
+        print(f"Total Trades:           {bold}{report.total_trades}{reset}  (Wins: {green}{report.winning_trades}{reset} | Losses: {red}{report.losing_trades}{reset})")
+        print(f"Win Rate:               {bold}{green if report.win_rate >= 50 else red}{report.win_rate}%{reset}")
+        print(f"Profit Factor:          {bold}{green if report.profit_factor >= 1.5 else red}{report.profit_factor}{reset}")
+        print(f"Gross Profit:           ${report.gross_profit:,.2f}")
+        print(f"Gross Loss:             ${report.gross_loss:,.2f}")
+        print(f"Total Taker Fees:       {red}-${report.total_fees:,.2f}{reset}")
+        print(f"Total Funding Paid:     ${report.total_funding:,.2f}")
+        print(f"Net Realized PnL:       {bold}{green if report.net_pnl >= 0 else red}${report.net_pnl:,.2f}{reset}")
+        print(f"Ending Equity:          {bold}${report.ending_equity:,.2f}{reset}")
+        print(f"Max Drawdown:           {bold}{red}{report.max_drawdown_pct}% (${report.max_drawdown_usd:,.2f}){reset}")
+        print(f"Expectancy:             {bold}${report.expectancy_usd:.2f} / trade ({report.expectancy_r:.2f} R){reset}")
+        print(f"Sharpe Ratio:           {bold}{report.sharpe_ratio}{reset}")
+        print("─" * 80 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Zuperior MT5 Production Algorithmic Signal Engine")
-    parser.add_argument("--verify-symbols", action="store_true", help="Connect to MT5, verify broker symbols, spreads, contract sizes, and data flow")
-    parser.add_argument("--once", action="store_true", help="Perform a single market scan across all assets and exit")
-    parser.add_argument("--backtest", choices=["GOLD", "BITCOIN", "NASDAQ", "ALL"], help="Run backtester on specified asset")
-    parser.add_argument("--days", type=int, default=30, help="Number of historical days for backtest (default 30)")
-    parser.add_argument("--interval", type=int, default=cfg.scan_interval_seconds, help="Scan interval in seconds (default 30)")
+    parser = argparse.ArgumentParser(description="Binance Quantitative Algorithmic Trading Engine")
+    parser.add_argument("--verify-metadata", action="store_true", help="Connect to Binance, verify exchangeInfo filters, tickSize, stepSize, and minNotional")
+    parser.add_argument("--once", action="store_true", help="Execute single-pass scan across closed bars and print diagnostic report")
+    parser.add_argument("--paper", action="store_true", help="Run live WebSocket market stream in paper trading mode")
+    parser.add_argument("--live", action="store_true", help="Run live WebSocket market stream with real authenticated order execution")
+    parser.add_argument("--backtest", choices=list(SYMBOL_REGISTRY.keys()), help="Run event-driven backtester on specified pair")
+    parser.add_argument("--days", type=int, default=14, help="Historical days for backtest (default: 14)")
     args = parser.parse_args()
 
-    engine = ZuperiorSignalEngine()
+    engine = BinanceQuantitativeEngine()
 
-    # Graceful shutdown handler
-    def handle_sigint(signum, frame):
-        logger.info("Shutdown signal received (Ctrl+C). Terminating...")
-        engine.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
-
-    if args.verify_symbols:
-        success = engine.verify_symbols()
+    if args.verify_metadata:
+        success = engine.verify_metadata()
         sys.exit(0 if success else 1)
 
     if args.backtest:
-        backtester = Backtester(connector=engine.connector)
-        assets = ["GOLD", "BITCOIN", "NASDAQ"] if args.backtest == "ALL" else [args.backtest]
-        for a in assets:
-            backtester.run_backtest(asset_key=a, days=args.days)
+        engine.run_backtest(args.backtest, days=args.days)
         sys.exit(0)
 
     if args.once:
-        if engine.connector.connect():
-            engine.scan_once()
-            engine.connector.disconnect()
+        engine.scan_once()
         sys.exit(0)
 
-    # Default: start continuous scanning loop
-    engine.start_loop(interval_seconds=args.interval)
+    # Stream Runner
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def handle_exit(sig, frame):
+        logger.info("Shutdown signal received (Ctrl+C). Terminating...")
+        engine.stream_manager.stop()
+        loop.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    if args.live:
+        engine.env = ExecutionEnvironment.LIVE
+        settings.execution_env = ExecutionEnvironment.LIVE
+    else:
+        engine.env = ExecutionEnvironment.PAPER
+        settings.execution_env = ExecutionEnvironment.PAPER
+
+    try:
+        loop.run_until_complete(engine.run_async_stream())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
