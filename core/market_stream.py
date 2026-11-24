@@ -38,6 +38,7 @@ class MarketStreamManager:
         # In-memory storage of latest market state
         self.book_tickers: Dict[str, dict] = {}    # symbol -> {bid, ask, spread_bps, time}
         self.mark_prices: Dict[str, dict] = {}     # symbol -> {mark_price, funding_rate, time}
+        self.latest_prices: Dict[str, float] = {}   # symbol -> live forming price
         self.klines_buffer: Dict[str, pd.DataFrame] = {} # symbol -> DataFrame of closed bars
 
         # Event listeners / callbacks
@@ -82,6 +83,8 @@ class MarketStreamManager:
                         })
                     df = pd.DataFrame(records).set_index('time')
                     self.klines_buffer[sym] = df
+                    if len(df) > 0:
+                        self.latest_prices[sym] = float(df['close'].iloc[-1])
                     logger.info(f"Warmed up {len(df)} historical {self.timeframe} closed bars for {sym}")
             except Exception as e:
                 logger.warning(f"Could not warm up history for {sym}: {e}")
@@ -132,33 +135,56 @@ class MarketStreamManager:
             return f"{self.ws_base_url}?streams={stream_path}"
         return f"{self.ws_base_url}/stream?streams={stream_path}"
 
+    async def _heartbeat_loop(self):
+        """Emits periodic telemetry so users have continuous visibility of socket health and countdown to next closed bar."""
+        await asyncio.sleep(10)
+        while self._running:
+            try:
+                now = int(time.time())
+                tf_seconds = 300 if self.timeframe == "5m" else 900
+                secs_remaining = tf_seconds - (now % tf_seconds)
+
+                prices_summary = " | ".join([
+                    f"{sym.replace('USDT', '')}: ${self.latest_prices.get(sym, 0.0):,.2f}"
+                    for sym in self.symbols if sym in self.latest_prices
+                ])
+                if prices_summary:
+                    logger.info(f"💓 [Heartbeat] Live Prices: {prices_summary} | Next {self.timeframe} candle close in ~{secs_remaining}s")
+            except Exception as e:
+                logger.debug(f"Heartbeat loop error: {e}")
+            await asyncio.sleep(30)
+
     async def start(self):
         """Starts the persistent WebSocket connection with exponential backoff reconnects."""
         self._running = True
         backoff = 1
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-        while self._running:
-            url = self.build_stream_url()
-            logger.info(f"Connecting to Binance WebSocket multiplex stream ({len(self.symbols)} pairs)...")
-            try:
-                # ping_interval=None relies on automatic RFC 6455 pong replies to server pings,
-                # preventing spurious client-side timeouts and transport write contention.
-                async with websockets.connect(url, ping_interval=None, close_timeout=5.0) as ws:
-                    logger.info("WebSocket connected. Subscribed to live market stream.")
-                    backoff = 1  # Reset backoff upon successful connection
+        try:
+            while self._running:
+                url = self.build_stream_url()
+                logger.info(f"Connecting to Binance WebSocket multiplex stream ({len(self.symbols)} pairs)...")
+                try:
+                    # ping_interval=None relies on automatic RFC 6455 pong replies to server pings,
+                    # preventing spurious client-side timeouts and transport write contention.
+                    async with websockets.connect(url, ping_interval=None, close_timeout=5.0) as ws:
+                        logger.info("WebSocket connected. Subscribed to live market stream.")
+                        backoff = 1  # Reset backoff upon successful connection
 
-                    while self._running:
-                        try:
-                            msg = await ws.recv()
-                            self._handle_stream_message(msg)
-                        except websockets.ConnectionClosed:
-                            logger.warning("Binance WebSocket stream closed by remote server.")
-                            break
+                        while self._running:
+                            try:
+                                msg = await ws.recv()
+                                self._handle_stream_message(msg)
+                            except websockets.ConnectionClosed:
+                                logger.warning("Binance WebSocket stream closed by remote server.")
+                                break
 
-            except Exception as e:
-                logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                except Exception as e:
+                    logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+        finally:
+            heartbeat_task.cancel()
 
     def stop(self):
         """Stops the market stream."""
@@ -202,6 +228,9 @@ class MarketStreamManager:
         """
         k = d.get("k", {})
         sym = d.get("s")
+        if sym and "c" in k:
+            self.latest_prices[sym] = float(k["c"])
+
         is_closed = k.get("x", False)
 
         if not is_closed or not sym:

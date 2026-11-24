@@ -155,9 +155,17 @@ class BinanceQuantitativeEngine:
         Event-driven callback triggered exclusively when a candle closes (kline.x == True).
         Guarantees zero repainting.
         """
+        last_close = float(df_closed['close'].iloc[-1])
         spread_bps = self.stream_manager.get_live_spread_bps(symbol)
         mark = self.stream_manager.mark_prices.get(symbol, {})
         funding_rate = mark.get("funding_rate", 0.0001)
+
+        verdict = self.regime_filter.classify_regime(
+            symbol=symbol,
+            df_ltf=df_closed,
+            spread_bps=spread_bps,
+            funding_rate=funding_rate
+        )
 
         signal = self.signal_engine.evaluate(
             symbol=symbol,
@@ -169,9 +177,12 @@ class BinanceQuantitativeEngine:
         if signal is not None:
             sizing = self.risk_manager.calculate_order_sizing(signal, self.account_equity)
             if sizing.is_valid:
+                logger.info(f"[{symbol}] 🚀 SIGNAL FIRED: {signal.direction} @ {sizing.entry_price} | SL: {sizing.stop_loss} | TP1: {sizing.take_profit_1} | Qty: {sizing.quantity}")
                 self.router.execute_bracket(sizing, int(signal.bar_time.timestamp()))
             else:
-                logger.info(f"[{symbol}] Signal rejected by Risk Manager: {sizing.rejection_reason}")
+                logger.warning(f"[{symbol}] Signal throttled by Risk Manager: {sizing.rejection_reason}")
+        else:
+            logger.info(f"[{symbol}] Evaluated closed 5m bar @ ${last_close:,.2f} | Regime: {verdict.regime.value} | Status: {verdict.reason}")
 
     async def run_async_stream(self):
         """Starts real-time async WebSocket loop."""
@@ -182,6 +193,9 @@ class BinanceQuantitativeEngine:
         self.router.sync_server_time()
         self.metadata.refresh()
         self.stream_manager.warm_up_history(count=150)
+
+        # Output initial market diagnostic snapshot table upon startup
+        self.scan_once()
 
         # Register event-driven callback
         self.stream_manager.add_closed_bar_listener(self._on_closed_candle)
