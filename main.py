@@ -29,6 +29,7 @@ from core.signal_engine import SignalEngine
 from core.risk_manager import RiskManager
 from execution.binance_router import BinanceOrderRouter
 from backtest.validator import EventDrivenBacktester, BacktestPerformanceReport
+from notifier import TradeNotifier
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -49,6 +50,7 @@ class BinanceQuantitativeEngine:
         self.signal_engine = SignalEngine(regime_filter=self.regime_filter)
         self.risk_manager = RiskManager(metadata=self.metadata)
         self.router = BinanceOrderRouter()
+        self.notifier = TradeNotifier()
         self.stream_manager = MarketStreamManager(symbols=list(SYMBOL_REGISTRY.keys()))
 
         self.account_equity: float = 10000.0  # Baseline equity in USDT
@@ -137,6 +139,8 @@ class BinanceQuantitativeEngine:
                     status_str = f"{green}{bold}✔ {signal.direction} {sizing.quantity} @ {sizing.entry_price} (SL: {sizing.stop_loss}){reset}"
                     # Execute
                     self.router.execute_bracket(sizing, int(signal.bar_time.timestamp()))
+                    # Dispatch Telegram / Webhook notification
+                    self.notifier.notify_binance(signal, sizing, self.account_equity)
                 else:
                     status_str = f"{yellow}Risk Throttled: {sizing.rejection_reason}{reset}"
             else:
@@ -179,6 +183,7 @@ class BinanceQuantitativeEngine:
             if sizing.is_valid:
                 logger.info(f"[{symbol}] 🚀 SIGNAL FIRED: {signal.direction} @ {sizing.entry_price} | SL: {sizing.stop_loss} | TP1: {sizing.take_profit_1} | Qty: {sizing.quantity}")
                 self.router.execute_bracket(sizing, int(signal.bar_time.timestamp()))
+                self.notifier.notify_binance(signal, sizing, self.account_equity)
             else:
                 logger.warning(f"[{symbol}] Signal throttled by Risk Manager: {sizing.rejection_reason}")
         else:
@@ -250,9 +255,20 @@ def main():
     parser.add_argument("--live", action="store_true", help="Run live WebSocket market stream with real authenticated order execution")
     parser.add_argument("--backtest", choices=list(SYMBOL_REGISTRY.keys()), help="Run event-driven backtester on specified pair")
     parser.add_argument("--days", type=int, default=14, help="Historical days for backtest (default: 14)")
+    parser.add_argument("--test-telegram", action="store_true", help="Send a test trade alert to verify Telegram bot token and chat ID")
     args = parser.parse_args()
 
     engine = BinanceQuantitativeEngine()
+
+    if args.test_telegram:
+        print("\n\033[1m\033[96mChecking Telegram Notifier configuration...\033[0m")
+        success, msg = engine.notifier.send_test_message()
+        if success:
+            print(f"\033[92m\033[1m✔ SUCCESS:\033[0m {msg}\n")
+            sys.exit(0)
+        else:
+            print(f"\033[91m\033[1m✖ ERROR:\033[0m {msg}\n")
+            sys.exit(1)
 
     if args.verify_metadata:
         success = engine.verify_metadata()

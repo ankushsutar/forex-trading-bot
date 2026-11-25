@@ -278,3 +278,85 @@ class TestOrderRouter:
         bar_ts = 1700000000
         order_res = router.execute_bracket(sizing, bar_timestamp=bar_ts)
         assert order_res.client_order_id == "SIG_BTCUSDT_1700000000_BUY"
+
+
+# ==============================================================================
+# 5. TELEGRAM NOTIFIER & DEDUPLICATION TESTS
+# ==============================================================================
+class TestTelegramNotifier:
+    def test_binance_signal_html_formatting(self):
+        from notifier import TradeNotifier
+        notifier = TradeNotifier()
+        sig = SignalEvent(
+            symbol="BTCUSDT",
+            direction="BUY",
+            archetype="SQUEEZE_BREAKOUT",
+            entry_price=60000.0,
+            stop_loss=59000.0,
+            take_profit_1=62500.0,
+            take_profit_2=64000.0,
+            risk_reward_ratio=2.5,
+            confluences=["Bollinger Band expansion", "Positive squeeze momentum"],
+            bar_time=datetime(2026, 11, 25, 6, 0, tzinfo=timezone.utc),
+            metrics={"spread_bps": 1.2, "funding_rate": 0.0001}
+        )
+        sizing = SizingResult(
+            is_valid=True,
+            symbol="BTCUSDT",
+            direction="BUY",
+            entry_price=60000.0,
+            stop_loss=59000.0,
+            take_profit_1=62500.0,
+            take_profit_2=64000.0,
+            quantity=0.10,
+            dollar_risk=100.0,
+            notional_value=6000.0,
+            risk_reward_ratio=2.5,
+            reduce_only=False
+        )
+
+        html = notifier._format_binance_telegram_html(sig, sizing, equity=10000.0)
+        assert "BTCUSDT" in html
+        assert "BUY / LONG" in html
+        assert "Squeeze Breakout" in html
+        assert "$60,000.00" in html
+        assert "1:2.50" in html
+        assert "Bollinger Band expansion" in html
+
+    def test_signal_deduplication(self):
+        from notifier import TradeNotifier
+        notifier = TradeNotifier()
+        sig = SignalEvent(
+            symbol="ETHUSDT",
+            direction="BUY",
+            archetype="LIQUIDITY_SWEEP",
+            entry_price=1700.0,
+            stop_loss=1680.0,
+            take_profit_1=1750.0,
+            take_profit_2=1780.0,
+            risk_reward_ratio=2.5,
+            confluences=["Asian Low Sweep"],
+            bar_time=datetime(2026, 11, 25, 7, 0, tzinfo=timezone.utc)
+        )
+        assert not notifier.is_duplicate(sig)
+        assert notifier.is_duplicate(sig)
+
+    def test_send_test_message_mock(self):
+        from notifier import TradeNotifier
+        notifier = TradeNotifier()
+        notifier.telegram_bot_token = "mock_token"
+        notifier.telegram_chat_id = "12345678"
+
+        mock_get_me = MagicMock()
+        mock_get_me.status_code = 200
+        mock_get_me.json.return_value = {"result": {"username": "TestTradingBot"}}
+
+        mock_send = MagicMock()
+        mock_send.status_code = 200
+
+        with patch("requests.get", return_value=mock_get_me), \
+             patch("requests.post", return_value=mock_send):
+            success, msg = notifier.send_test_message()
+            assert success
+            assert "TestTradingBot" in msg
+
